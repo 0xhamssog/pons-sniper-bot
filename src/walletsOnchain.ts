@@ -67,17 +67,22 @@ export async function sweepWallets(input: {
   destination: Address;
   wallets: StoredWallet[];
 }): Promise<Array<{ address: Address; hash?: Hex; amount?: bigint; error?: string }>> {
-  const gasPrice = await input.publicClient.getGasPrice();
-  const gasCost = 21_000n * gasPrice + GAS_BUFFER;
+  // The node checks value + gas * maxFeePerGas against the balance, so the fee reserved
+  // here must be the same maxFeePerGas the transaction is sent with, not eth_gasPrice.
+  const { maxFeePerGas, maxPriorityFeePerGas } = await input.publicClient.estimateFeesPerGas();
 
   return Promise.all(
     input.wallets.map(async (wallet) => {
       const account = privateKeyToAccount(wallet.privateKey);
-      const balance = await input.publicClient.getBalance({ address: account.address });
-      if (balance <= gasCost) {
+      const [balance, gas] = await Promise.all([
+        input.publicClient.getBalance({ address: account.address }),
+        input.publicClient.estimateGas({ account: account.address, to: input.destination, value: 0n }),
+      ]);
+      const gasCost = gas * maxFeePerGas;
+      if (balance <= gasCost + GAS_BUFFER) {
         return { address: wallet.address, amount: 0n, error: "balance too low to sweep" };
       }
-      const value = balance - 21_000n * gasPrice;
+      const value = balance - gasCost;
       try {
         const client = createWalletClient({
           account,
@@ -89,6 +94,9 @@ export async function sweepWallets(input: {
           chain: input.chain,
           to: input.destination,
           value,
+          gas,
+          maxFeePerGas,
+          maxPriorityFeePerGas,
         });
         const receipt = await input.publicClient.waitForTransactionReceipt({ hash });
         if (receipt.status !== "success") return { address: wallet.address, hash, error: "reverted" };
